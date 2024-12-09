@@ -1,0 +1,194 @@
+from oauthlib.oauth1 import SIGNATURE_PLAINTEXT
+from requests_oauthlib import OAuth1Session
+import requests
+import json
+
+
+MAAS_HOST = "http://localhost/MAAS"
+API_KEY = "api-key"
+BOND_NUMBERS = 2
+BOND0_MEMBER = ['enp7s0', 'enp8s0']
+BOND1_MEMBER = ['enp9s0', 'enp10s0']
+TARGET_MACHINE_HOSTNAME = 'gpu-machine'
+SPACE_NAME_TO_CREATE = 'space'
+FABRIC_NAME_TO_CREATE = 'fabric'
+VLAN_TAG_TO_CREATE_FOR_BOND0 = 100
+VLAN_TAG_TO_CREATE_FOR_BOND1 = 200
+SUBNET_TO_CREATE_FOR_BOND0 = '111.0.1.0/24'
+SUBNET_TO_CREATE_FOR_BOND1 = '111.0.2.0/24'
+
+ALLOCATION = 'DHCP'
+
+class MAASClient():
+    def __init__(self, maas_host, api_key, signature_method):
+        self.maas_host = maas_host
+        consumer_key, consumer_token, secret = api_key.split(":")
+        self.maas_session = OAuth1Session(
+            consumer_key,
+            resource_owner_key=consumer_token,
+            resource_owner_secret=secret,
+            signature_method=signature_method
+        )
+
+    def get_machines(self):
+        response = self.maas_session.get(f"{self.maas_host}/api/2.0/machines/")
+        response.raise_for_status()
+        machines_response = json.loads(response.text)
+        machines = [machine for machine in machines_response]
+        return machines  
+
+    def print_machine_info(self, machine):
+        print(f"System ID: {machine['system_id']}")
+        print(f"Hostname: {machine['hostname']}")
+        print(f"Status: {machine['status_name']}")
+        print(f"CPU: {machine['cpu_count']}")
+        print(f"Memory: {machine['memory'] / 1024 / 1024} GB")
+        print(f"Storage: {machine['storage']} GB")
+        print(f"Power State: {machine['power_state']}")
+
+        interfaces = machine['interface_set']
+        for interface in interfaces:
+            print(f"Interface Name: {interface['name']}")
+            print(f"Interface ID: {interface['id']}")
+            print(f"MAC Address: {interface['mac_address']}")
+            print("-" * 20)
+        print("-" * 40)
+
+    def get_machine_interfaces(self, machine_id):
+        response = self.maas_session.get(f"{self.maas_host}/api/2.0/nodes/{machine_id}/interfaces/")
+        interfaces_response = json.loads(response.text)
+        interfaces = [interface for interface in interfaces_response]
+        return interfaces  
+
+    def get_interface_id(self, machine_id, interface_name):
+        interfaces = self.get_machine_interfaces(machine_id)
+        for interface in interfaces:
+            if interface['name'] == interface_name:
+                return interface['id']
+    
+    def get_machine_id(self, machine_name):
+        machines = self.get_machines()
+        for machine in machines:
+            if machine['hostname'] == machine_name:
+                return machine['system_id']
+    
+
+    def get_fabrics(self):
+        response = self.maas_session.get(f"{self.maas_host}/api/2.0/fabrics/")
+        fabrics_response = json.loads(response.text)
+        fabrics = [fabric for fabric in fabrics_response]
+        return fabrics  
+
+    def get_subnets(self):
+        response = self.maas_session.get(f"{self.maas_host}/api/2.0/subnets/")
+        subnets_response = json.loads(response.text)
+        subnets = [subnet for subnet in subnets_response]
+        return subnets  
+
+    def get_vlans(self, fabric_id):
+        response = self.maas_session.get(f"{self.maas_host}/api/2.0/fabrics/{fabric_id}/vlans/")
+        vlans_response = json.loads(response.text)
+        vlans = [vlan for vlan in vlans_response]
+        return vlans
+
+    def update_interface_vlan(self, target_machine, interface_id, vlan_id):
+        body = {
+            'vlan': vlan_id
+        }
+        response = self.maas_session.put(f"{self.maas_host}/api/2.0/nodes/{target_machine}/interfaces/{interface_id}/", data=body)
+        return response.json()   
+
+    def update_interface_subnet(self, target_machine, interface_id, subnet_id, mode=None, ip_address=None, default_gateway=None):
+        body = {
+            'subnet': subnet_id,
+            'mode': mode,
+            'ip_address': ip_address,
+            'default_gateway': default_gateway
+        }
+        response = self.maas_session.post(f"{self.maas_host}/api/2.0/nodes/{target_machine}/interfaces/{interface_id}/op-link_subnet", data=body)
+        return response.json()   
+
+    def create_space(self, space_name):
+        body = {
+            'name': space_name
+        }
+        response = self.maas_session.post(f"{self.maas_host}/api/2.0/spaces/", data=body)
+        return response.json()
+
+    def create_fabric(self, fabric_name, description=None):
+        body = {
+            'description ': description,
+            'name': fabric_name
+        }
+        response = self.maas_session.post(f"{self.maas_host}/api/2.0/fabrics/", data=body)
+        return response.json()  
+    
+    def create_vlan(self, fabric_id, space='undefined', vid=0, vlan_name=None, mtu=1500, description=None):
+        body = {
+            'description ': description,
+            'name': vlan_name,
+            'mtu': mtu,
+            'vid': vid,
+            'space': space
+        }
+        response = self.maas_session.post(f"{self.maas_host}/api/2.0/fabrics/{fabric_id}/vlans/", data=body)
+        return response.json()  
+
+    def create_bond(self, machine_id, bond_name, interfaces, vlan_id, bond_lacp_rate='fast', bond_mode='802.3ad', bond_xmit_hash_policy='layer2+3'):
+        interface_ids = []
+        for interface in interfaces:
+            interface_id = self.get_interface_id(machine_id, interface)
+            self.update_interface_vlan(machine_id, interface_id, vlan_id)
+            interface_ids.append(interface_id)
+        body = {
+            'name': bond_name,
+            'bond_mode': bond_mode,
+            'bond_lacp_rate': bond_lacp_rate,
+            'bond_xmit_hash_policy': bond_xmit_hash_policy,
+            'parents': interface_ids
+        }
+        response = self.maas_session.post(f"{self.maas_host}/api/2.0/nodes/{machine_id}/interfaces/op-create_bond", data=body)
+        return response.json()
+
+    def create_subnet(self, cidr, fabric=None, vid=None, name=None, vlan=None, space=None, dns_servers=None, gateway_ip=None):
+        body = {
+            'cidr': cidr,
+            'name': name,
+            'fabric': fabric,
+            'vid': vid,
+            'vlan': vlan,
+            'gateway_ip': gateway_ip,
+            'dns_servers': dns_servers,
+            'space': space
+        }
+        print(body)
+        response = self.maas_session.post(f"{self.maas_host}/api/2.0/subnets/", data=body)
+        return response.json()  
+
+    def update_subnet(self, fabric, id):
+        body = {
+            'fabric': fabric
+        }
+        response = self.maas_session.post(f"{self.maas_host}/api/2.0/subnets/{id}/", data=body)
+        return response.json()  
+
+if __name__ == "__main__":
+    
+    #Create MAAS session
+    maas_client = MAASClient(MAAS_HOST, API_KEY, SIGNATURE_PLAINTEXT)
+
+    #Get target machine id
+    machine_id = maas_client.get_machine_id(TARGET_MACHINE_HOSTNAME)
+
+    #Create space, fabric
+    space = maas_client.create_space(SPACE_NAME_TO_CREATE)
+    fabric = maas_client.create_fabric(FABRIC_NAME_TO_CREATE)
+
+    #Create bonding
+    for i in range(0, BOND_NUMBERS):
+        vlan = maas_client.create_vlan(fabric['id'], space['name'], globals().get(f"VLAN_TAG_TO_CREATE_FOR_BOND{i}"))
+        interfaces = globals().get(f"BOND{i}_MEMBER", [])
+        bond = maas_client.create_bond(machine_id, f"bond{i}", interfaces, vlan['id'])
+        cidr = globals().get(f"SUBNET_TO_CREATE_FOR_BOND{i}")
+        subnet = maas_client.create_subnet(cidr, str(fabric['id']), vlan['vid'])     
+        maas_client.update_interface_subnet(machine_id, bond['id'], subnet['id'], ALLOCATION)
